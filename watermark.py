@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 
 
 # Constants and strings
+TOURNAMENT_NAME = ""
 N_THREADS = 4  # NOTE: Set to about the number of cores for optimal performance
 DEF_STAMP_FN = "_overlay.pdf"  # Tmp file location for watermark
 PATH_TO_STATIC = "fakepath/"  # NOTE: Fill me in to create htaccess files
@@ -50,7 +51,12 @@ def main():
         help='Create .htaccess files for Apache access control',
         dest='create_htaccess'
         )
-
+    parser.add_argument(
+        '--cached_credentials',
+        default=None,
+        help='Path to csv of saved credentials',
+        metavar='cached_credentials'
+    )
 
     args = parser.parse_args()
 
@@ -58,10 +64,16 @@ def main():
     output_directory = args.output_directory
     test_directory = args.test_directory
     create_htaccess = args.create_htaccess
-    watermark(n_teams, test_directory, output_directory, create_htaccess)
+    cached_credentials = args.cached_credentials
+    if cached_credentials != None:
+        print "Using cached credentials from file %s" % cached_credentials
+        cached_credentials = parse_cached(cached_credentials)
+    watermark(n_teams, test_directory, output_directory, create_htaccess,
+              cached_credentials)
 
 
-def watermark(n_teams, test_directory, output_directory, create_htaccess):
+def watermark(n_teams, test_directory, output_dir, create_htaccess,
+              cached_credentials=None):
     """ Main interface for watermarking documents
 
     Creates team codes, team watermarks, and output directory structure
@@ -70,59 +82,46 @@ def watermark(n_teams, test_directory, output_directory, create_htaccess):
     Args:
         n_teams: positive integer number of teams
         test_directory: path to directory holding tests to watermark
-        output_directory: path to output directory
+        output_dir: path to output directory
         create_htaccess: boolean, True to automatically create .htaccess files
+        cached_credentials: Pass a tuple of lists
+            'TeamNum','Password','Code'
     """
 
     # Prompt for deleting directory + team code
     # Create password file randomly
-    if os.path.exists(output_directory):
-        if raw_input("%s already exists! Delete [Y/n]? " % output_directory) != 'Y':
+    if os.path.exists(output_dir):
+        if raw_input("%s already exists! Delete [Y/n]? " % output_dir) != 'Y':
             exit("Aborted: target directory already exists")
-        rmtree(output_directory)
-    os.mkdir(output_directory)
+        rmtree(output_dir)
+    os.mkdir(output_dir)
 
     if create_htaccess:
-        passwd_file = os.path.join(output_directory, ".htpasswd")
+        passwd_file = os.path.join(output_dir, ".htpasswd")
         open(passwd_file, 'w') # Create empty password file
         htaccess_config_n = HTACCESS_CONFIG % (passwd_file, "%s")
         # Deny access by default so .htpasswd is not leaked
-        root_htaccess = os.path.join(output_directory, ".htaccess")
-        with open(root_htaccess, 'w') as f:
+        with open(os.path.join(output_dir, ".htaccess"), 'w') as f:
             f.write(htaccess_config_n % " all denied")
 
-    data_file = os.path.join(output_directory, 'team_data.csv')
-    open(data_file, 'w') # Create empty data file
+    if cached_credentials is None:
+        # Create passwords and codes
+        teams = xrange(1, n_teams+1)
+        passwords = generate_passwords(n_teams)
+        codes = generate_codes(n_teams)
+    else:
+        teams, passwords, codes = cached_credentials
 
-    # Create passwords and codes
-    passwords = generate_passwords(n_teams)
-    codes = generate_codes(n_teams)
-
-    # Save team password and code data to csv
-    with open(data_file, 'w') as f:
-        # Write header
-        f.write(DATA_FILE_HEADER)
-        for i in xrange(n_teams):
-            # Append line to data
-            f.write(DATA_FILE_LINE % (i+1, passwords[i], codes[i]))
-            if create_htaccess:
-                # Add password to .htpasswd
-                check_call([
-                    'htpasswd',
-                    '-b',
-                    passwd_file,
-                    str(i+1),
-                    passwords[i]
-                ])
+    save_team_information(os.path.join(output_dir, 'team_data.csv'),
+                          teams, passwords, codes)
 
     # Create a subdirectory for every team
-    for i in xrange(n_teams):
-        subdir = os.path.join(output_directory, str(i+1))
-        os.mkdir(subdir)
+    for team in teams:
+        os.mkdir(os.path.join(output_dir, str(team)))
         if create_htaccess:
             # Create subfolder htaccess: only that team has access
-            with open(os.path.join(subdir, '.htaccess'), 'w') as f:
-                f.write(htaccess_config_n % ("user " + str(i+1)))
+            with open(os.path.join(output_dir, str(team), '.htaccess'), 'w') as f:
+                f.write(htaccess_config_n % ("user " + str(team)))
 
     # Obtain list of tests to watermark
     tests = []
@@ -130,16 +129,23 @@ def watermark(n_teams, test_directory, output_directory, create_htaccess):
         if f.endswith(".pdf") and os.path.isfile(os.path.join(test_directory, f)):
             tests.append(os.path.join(test_directory, f))
 
-    total = 0
     # Apply watermark to all tests for all teams
-    for i in xrange(n_teams):
-        print "Watermarking team %d" % (i+1)
-        apply_overlays(tests, i+1, codes[i], output_directory)
-        total += len(tests)
+    for i in xrange(len(teams)):
+        print "Watermarking team %d" % (teams[i])
+        apply_overlays(tests, teams[i], codes[i], output_dir)
+        if create_htaccess:
+            # Add password to .htpasswd
+            check_call([
+                'htpasswd',
+                '-b',
+                passwd_file,
+                str(teams[i]),
+                passwords[i]
+            ])
 
     print ""
-    print "Created a total of %d documents" % total
-    print "Watermarked pdfs can be found in %s" % output_directory
+    print "Created a total of %d documents" % (len(teams) * len(tests))
+    print "Watermarked pdfs can be found in %s" % output_dir
 
 
 def apply_overlays(tests, team, code, target_dir):
@@ -150,12 +156,12 @@ def apply_overlays(tests, team, code, target_dir):
         tests: List of filenames of tests to watermark
         team: Integer number of team to watermark
         code: Alphanumeric code of team
-        Directory: Path to the existing directory in which to place output
+        target_dir: Path to the existing directory in which to place output
     """
-    # NOTE: Change the main text to add to each team here
+    # NOTE: Change the main text here
     create_overlay("C-%d" % team, code)
     # Parallelize over multiple threads
-    pool = ThreadPool(N_THREADS)
+    pool = ThreadPool(4)
 
     def do_watermark(document_file):
         """Helper function to map tasks over thread pool
@@ -199,18 +205,24 @@ def create_overlay(main_txt, code, filename=DEF_STAMP_FN):
         filename: Where to save overlay
     """
     tmp_page_name = ".tmp_overlay.pdf"
-    f, ax = plt.subplots(1, 1, figsize=(8.5, 11))
+    fig, ax = plt.subplots(1, 1, figsize=(8.5, 11))
     ax.set_ylim(0, 1)
     ax.set_xlim(0, 1)
 
     # NOTE: Change constants here to adjust size, color, and placement of mark
     # Add team-specific code
-    ax.text(0.5, 0.05, code, alpha=0.35, size=12,
+    ax.text(0.5, 0.05, TOURNAMENT_NAME + " " + code, alpha=0.35, size=12,
             horizontalalignment='center', color='blue')
     # Add main watermark
     ax.text(0.5, 0.5, main_txt, alpha=0.15, size=130,
             horizontalalignment='center', color='black')
+
+    # Clear plot of axes and margins
+    ax.set_frame_on(False)
+    ax.set_xticks([])
+    ax.set_yticks([])
     plt.axis('off')
+    fig.subplots_adjust(left=0, right=1.0, top=1.0, bottom=0)
     plt.savefig(
         tmp_page_name,
         format='pdf',
@@ -258,6 +270,42 @@ def generate_codes(n_teams):
     return [''.join(random.choice('1234567890abcdefghijklmnopqrstuvwxyz')
                     for j in xrange(8))
             for _ in xrange(n_teams)]
+
+
+def parse_cached(cached_credentials):
+    """Parse existing csv file
+
+    Requires first 4 columns to be TeamNum, Password, Code, Color [in hex]
+    """
+    teamnums = []
+    passwords = []
+    codes = []
+    with open(cached_credentials) as f:
+        f.readline()
+        for line in f:
+            tokens = line[:-1].split(',')
+            teamnums.append(int(tokens[0]))
+            passwords.append(tokens[1])
+            codes.append(tokens[2])
+
+    return (teamnums, passwords, codes)
+
+
+def save_team_information(data_file, teams, passwords, codes):
+    """Save team password and data to csv
+
+    Columns are 'TeamNum,Password,Code,Color'
+    """
+    with open(data_file, 'w') as f:
+        # Write header
+        f.write(DATA_FILE_HEADER)
+        for i, team in enumerate(teams):
+            # Append line to data
+            f.write(DATA_FILE_LINE % (
+                team,
+                passwords[i],
+                codes[i]
+            ))
 
 
 if __name__ == "__main__":
